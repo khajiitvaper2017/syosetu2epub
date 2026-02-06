@@ -71,4 +71,5 @@ python syosetu_downloader.py https://ncode.syosetu.com/abcd1234/12/
 - `--vertical` only affects EPUB output.
 
 **License**
+
 GPL-3.0. See `LICENSE`.
