@@ -3,6 +3,7 @@
 Download novels from syosetu.com and package them as EPUB2 or TXT with optional volume splitting, chapter selection, and furigana removal.
 
 **Acknowledgements**
+
 This project was inspired by and is somewhat based on https://github.com/cessen/syosetu2ebook/.
 That script didn't work for me, as it's epubs didn't open in ttsu-reader properly.
 So I asked Codex to convert it to python and then heavily modified it to my needs.
