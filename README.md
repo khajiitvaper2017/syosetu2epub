@@ -13,6 +13,7 @@ So I asked Codex to convert it to python and then heavily modified it to my need
 - Supports multi-page TOCs and volume headings.
 - Select chapter ranges or specific volumes.
 - Optional furigana (ruby) removal.
+- Normalizes ASCII punctuation and digits to Japanese full-width forms in text.
 - Preserves preface (前書き / maegaki) and afterword (後書き / atogaki) sections.
 - Parallel chapter downloads with `--jobs`.
 - Embeds images in EPUB and includes image placeholders in TXT.

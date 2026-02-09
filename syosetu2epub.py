@@ -55,7 +55,19 @@ _JP_PUNCT_MAP = {
     '"': "＂",
     "'": "＇",
 }
-_JP_PUNCT_TRANSLATION = str.maketrans(_JP_PUNCT_MAP)
+_JP_DIGIT_MAP = {
+    "0": "０",
+    "1": "１",
+    "2": "２",
+    "3": "３",
+    "4": "４",
+    "5": "５",
+    "6": "６",
+    "7": "７",
+    "8": "８",
+    "9": "９",
+}
+_JP_TEXT_TRANSLATION = str.maketrans({**_JP_PUNCT_MAP, **_JP_DIGIT_MAP})
 _URL_RE = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
 _IMG_TAG_RE = re.compile(
     r"<img\b[^>]*?\bsrc\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s>]+))[^>]*>",
@@ -70,6 +82,7 @@ _IMG_EXT_BY_MIME = {
     "image/bmp": ".bmp",
     "image/svg+xml": ".svg",
 }
+_SEPARATOR_CHARS = "-_－＿—–―ｰー─━"
 
 
 def normalize_japanese_punct(text: str) -> str:
@@ -91,7 +104,7 @@ def normalize_japanese_punct(text: str) -> str:
 
 def translate_japanese_punct(text: str) -> str:
     if "." not in text:
-        return text.translate(_JP_PUNCT_TRANSLATION)
+        return text.translate(_JP_TEXT_TRANSLATION)
     out: list[str] = []
     text_len = len(text)
     for i, ch in enumerate(text):
@@ -104,8 +117,17 @@ def translate_japanese_punct(text: str) -> str:
                 out.append(_JP_PUNCT_MAP["."])
             continue
         mapped = _JP_PUNCT_MAP.get(ch)
+        if mapped is None:
+            mapped = _JP_DIGIT_MAP.get(ch)
         out.append(mapped if mapped is not None else ch)
     return "".join(out)
+
+
+def is_separator_line(text: str) -> bool:
+    compact = "".join(ch for ch in text if not ch.isspace())
+    if len(compact) < 4:
+        return False
+    return all(ch in _SEPARATOR_CHARS for ch in compact)
 
 
 def get_page(url: str, timeout: int, delay: float, retries: int, user_agent: str) -> str:
@@ -429,6 +451,8 @@ class ChapterParser(HTMLParser):
             text_content = "".join(self._current_text_parts)
             if not text_content.strip() and not html_content.strip():
                 self.paragraphs.append("")
+            elif is_separator_line(text_content):
+                self.paragraphs.append("__SEPARATOR__")
             else:
                 self.paragraphs.append(html_content)
             self._in_p = False
@@ -826,6 +850,7 @@ def write_txt(path: str, title: str, author: str, chapters: list[dict], book_url
         "__AFTERWORD__": (SEPARATOR_LINE, "", "後書き", ""),
         "__PREFACE_END__": (SEPARATOR_LINE,),
         "__AFTERWORD_END__": (SEPARATOR_LINE,),
+        "__SEPARATOR__": (SEPARATOR_LINE,),
     }
 
     out_lines: list[str] = []
@@ -932,6 +957,7 @@ def build_epub2(
         ),
         "__PREFACE_END__": ('<hr class="separator" />',),
         "__AFTERWORD_END__": ('<hr class="separator" />',),
+        "__SEPARATOR__": ('<hr class="separator" />',),
     }
 
     chapter_files: list[tuple[str, str]] = []
