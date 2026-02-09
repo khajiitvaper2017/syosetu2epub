@@ -1463,7 +1463,11 @@ def write_output(
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Download a syosetu novel to an EPUB2 file.")
-    p.add_argument("book_url", help="Full URL of the novel's main page on syosetu.com")
+    p.add_argument(
+        "book_url",
+        nargs="?",
+        help="Full URL of the novel's main page on syosetu.com",
+    )
     p.add_argument("-o", "--output", help="Output file path")
     p.add_argument(
         "--output-dir",
@@ -1515,6 +1519,13 @@ def main() -> None:
         config[CONFIG_OUTPUT_DIR_KEY] = normalized_output_dir
         save_config(CONFIG_PATH, config)
         config_output_dir = normalized_output_dir
+
+    if not args.book_url:
+        if args.output_dir is not None:
+            print(f"Saved default output folder: {config_output_dir}")
+            return
+        print("Missing book_url. Provide a URL or use --output-dir to set the default output folder.")
+        return
 
     if args.vertical_text and args.format == "txt":
         print("Note: --vertical only applies to EPUB output.")
