@@ -1,6 +1,8 @@
 import argparse
 import base64
 import html
+import json
+import os
 import re
 import socket
 import ssl
@@ -29,6 +31,8 @@ DEFAULT_RETRIES = 3
 DEFAULT_TIMEOUT = 60
 DEFAULT_SKIP_ERRORS = False
 SEPARATOR_LINE = "-" * 32
+CONFIG_PATH = Path.home() / ".syosetu2epub.json"
+CONFIG_OUTPUT_DIR_KEY = "output_dir"
 
 _WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -221,6 +225,68 @@ def safe_filename(name: str, default: str = "syosetu") -> str:
     if name.upper() in _WINDOWS_RESERVED_NAMES:
         name = f"_{name}"
     return name
+
+
+def expand_path(value: str) -> Path:
+    expanded = os.path.expandvars(value)
+    return Path(expanded).expanduser()
+
+
+def load_config(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"Warning: failed to read config {path}: {e}")
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"Warning: failed to parse config {path}: {e}")
+        return {}
+    if not isinstance(data, dict):
+        print(f"Warning: config file {path} is not a JSON object.")
+        return {}
+    return data
+
+
+def save_config(path: Path, data: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(data, indent=2, sort_keys=True, ensure_ascii=True),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+    except OSError as e:
+        print(f"Warning: failed to write config {path}: {e}")
+
+
+def resolve_output_base(
+    output_path: Optional[str],
+    default_dir: Optional[str],
+    title: str,
+) -> tuple[Path, str, Optional[str]]:
+    base_name = safe_filename(title)
+    base_out_dir: Optional[Path] = None
+    output_name: Optional[str] = None
+
+    if output_path:
+        out_path = expand_path(output_path)
+        if out_path.suffix:
+            output_name = out_path.name
+            base_name = safe_filename(out_path.stem)
+            if out_path.parent != Path("."):
+                base_out_dir = out_path.parent
+        else:
+            base_out_dir = out_path
+
+    if base_out_dir is None:
+        base_out_dir = expand_path(default_dir) if default_dir else Path(".")
+
+    return base_out_dir, base_name, output_name
 
 
 def has_class(attrs: dict[str, Optional[str]], class_name: str) -> bool:
@@ -1226,6 +1292,12 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Download a syosetu novel to an EPUB2 file.")
     p.add_argument("book_url", help="Full URL of the novel's main page on syosetu.com")
     p.add_argument("-o", "--output", help="Output file path")
+    p.add_argument(
+        "--output-dir",
+        "--output-folder",
+        dest="output_dir",
+        help="Default base output folder (saved in config).",
+    )
     p.add_argument("-f", "--format", choices=("epub", "txt"), default="epub")
     p.add_argument("-c", "--chapters", help="Chapter range N-M (1-based)")
     p.add_argument(
@@ -1251,6 +1323,24 @@ def main() -> None:
     )
     p.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help="Parallel download jobs")
     args = p.parse_args()
+
+    config = load_config(CONFIG_PATH)
+    config_output_dir: Optional[str] = None
+    raw_output_dir = config.get(CONFIG_OUTPUT_DIR_KEY)
+    if isinstance(raw_output_dir, str):
+        raw_output_dir = raw_output_dir.strip()
+        if raw_output_dir:
+            config_output_dir = raw_output_dir
+
+    if args.output_dir is not None:
+        if not args.output_dir.strip():
+            print("Invalid --output-dir value.")
+            return
+        expanded_output_dir = expand_path(args.output_dir)
+        normalized_output_dir = os.path.abspath(str(expanded_output_dir))
+        config[CONFIG_OUTPUT_DIR_KEY] = normalized_output_dir
+        save_config(CONFIG_PATH, config)
+        config_output_dir = normalized_output_dir
 
     if args.vertical_text and args.format == "txt":
         print("Note: --vertical only applies to EPUB output.")
@@ -1395,15 +1485,11 @@ def main() -> None:
 
         selected_volumes = [(i, display_volumes[i - 1]) for i in sorted(selected_vol_indices)]
 
-        base_out_dir = Path(".")
-        base_name = safe_filename(title)
-        if args.output:
-            out_path = Path(args.output)
-            if out_path.suffix:
-                base_out_dir = out_path.parent
-                base_name = safe_filename(out_path.stem)
-            else:
-                base_out_dir = out_path
+        base_out_dir, base_name, _output_name = resolve_output_base(
+            args.output,
+            config_output_dir,
+            title,
+        )
         out_dir = base_out_dir / safe_filename(title)
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1484,7 +1570,12 @@ def main() -> None:
             print("Cannot use --volume without TOC volume headings.")
             return
 
-        out_dir = (Path(args.output) if args.output else Path(".")) / safe_filename(title)
+        base_out_dir, base_name, output_name = resolve_output_base(
+            args.output,
+            config_output_dir,
+            title,
+        )
+        out_dir = base_out_dir / safe_filename(title)
         out_dir.mkdir(parents=True, exist_ok=True)
         chapters = download_chapters(
             selected_links,
@@ -1496,15 +1587,14 @@ def main() -> None:
             UA,
             args.remove_furigana,
         )
-        if args.output and Path(args.output).suffix:
-            out_path = out_dir / Path(args.output).name
+        if output_name:
+            out_path = out_dir / output_name
         else:
-            base_label = safe_filename(title)
             if len(chapters) == 1:
                 chap_label = safe_filename(chapters[0].get("title") or "Chapter 1")
-                filename = f"{base_label} - {chap_label}.{args.format}"
+                filename = f"{base_name} - {chap_label}.{args.format}"
             else:
-                filename = f"{base_label}.{args.format}"
+                filename = f"{base_name}.{args.format}"
             out_path = out_dir / filename
         volume_breaks = build_volume_breaks(volumes, chapters) if found_volume and args.format == "epub" else None
         write_output(

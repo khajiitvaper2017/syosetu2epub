@@ -30,6 +30,7 @@ python syosetu2epub.py <book_url> [options]
 
 **Options**
 - `-o, --output` Output path. If a filename is provided, that name is used inside the novel's output folder. If a directory is provided, outputs are written under that directory.
+- `--output-dir, --output-folder` Set the default base output folder and save it to config (used when `--output` is not provided).
 - `-f, --format` Output format: `epub` or `txt` (default: `epub`).
 - `-c, --chapters` Chapter range in `N-M` (1-based, inclusive).
 - `-v, --volume, --volumes` Volume selection such as `1,3-4` or `all` (when the TOC has volume headings).
@@ -63,7 +64,7 @@ python syosetu2epub.py https://ncode.syosetu.com/abcd1234/12/
 ```
 
 **Output Layout**
-- Outputs are written under `<base>/<Title>/` where `<base>` is the current directory or the path provided via `--output`.
+- Outputs are written under `<base>/<Title>/` where `<base>` is the current directory, the path provided via `--output`, or the saved config output folder.
 - Filenames are derived from the novel title and volume/chapter titles, with safe characters for Windows.
 
 **Notes**
@@ -72,6 +73,7 @@ python syosetu2epub.py https://ncode.syosetu.com/abcd1234/12/
 - When multiple volumes are downloaded to EPUB, the script can optionally merge them into a single "Complete" EPUB in interactive mode.
 - Passing a direct chapter URL (e.g., `.../12/`) auto-selects that chapter if `--chapters` is not provided.
 - `--vertical` only affects EPUB output.
+- Config is stored at `~/.syosetu2epub.json` and currently saves `output_dir`.
 
 **Issues & Contributions**
 
