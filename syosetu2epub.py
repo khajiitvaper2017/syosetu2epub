@@ -7,6 +7,7 @@ import re
 import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -17,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
 from random import uniform
-from typing import Optional
+from typing import Mapping, Optional, TypedDict
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) "
@@ -33,6 +34,13 @@ DEFAULT_SKIP_ERRORS = False
 SEPARATOR_LINE = "-" * 32
 CONFIG_PATH = Path.home() / ".syosetu2epub.json"
 CONFIG_OUTPUT_DIR_KEY = "output_dir"
+MAX_FILENAME_LEN = 120
+
+MARK_PREFACE = "__PREFACE__"
+MARK_PREFACE_END = "__PREFACE_END__"
+MARK_AFTERWORD = "__AFTERWORD__"
+MARK_AFTERWORD_END = "__AFTERWORD_END__"
+MARK_SEPARATOR = "__SEPARATOR__"
 
 _WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -89,6 +97,23 @@ _IMG_EXT_BY_MIME = {
 _SEPARATOR_CHARS = "-_－＿—–―ｰー─━"
 
 
+class Chapter(TypedDict):
+    title: str
+    paragraphs: list[str]
+    url: str
+
+
+class ImageItem(TypedDict):
+    href: str
+    media_type: str
+    data: bytes
+
+
+class Volume(TypedDict):
+    title: str
+    chapters: list[str]
+
+
 def normalize_japanese_punct(text: str) -> str:
     if not text:
         return text
@@ -134,10 +159,42 @@ def is_separator_line(text: str) -> bool:
     return all(ch in _SEPARATOR_CHARS for ch in compact)
 
 
-def get_page(url: str, timeout: int, delay: float, retries: int, user_agent: str) -> str:
+class RateLimiter:
+    def __init__(self, min_interval: float) -> None:
+        self.min_interval = max(0.0, min_interval)
+        self._lock = threading.Lock()
+        self._next_time = (
+            time.monotonic() + self.min_interval if self.min_interval > 0 else 0.0
+        )
+
+    def wait(self) -> None:
+        if self.min_interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            if now < self._next_time:
+                sleep_for = self._next_time - now
+                self._next_time += self.min_interval
+            else:
+                sleep_for = 0.0
+                self._next_time = now + self.min_interval
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+
+def _fetch_url(
+    url: str,
+    timeout: int,
+    delay: float,
+    retries: int,
+    user_agent: str,
+    limiter: Optional[RateLimiter] = None,
+) -> tuple[bytes, Mapping[str, str]]:
     last_err: Optional[BaseException] = None
     for attempt in range(retries + 1):
-        if delay > 0:
+        if limiter is not None:
+            limiter.wait()
+        elif delay > 0:
             time.sleep(delay)
         req = urllib.request.Request(
             url,
@@ -149,7 +206,7 @@ def get_page(url: str, timeout: int, delay: float, retries: int, user_agent: str
         ctx = ssl._create_unverified_context()
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-                return resp.read().decode("utf-8", errors="replace")
+                return resp.read(), resp.headers
         except urllib.error.HTTPError as e:
             last_err = e
             if e.code in (429, 500, 502, 503, 504) and attempt < retries:
@@ -165,58 +222,52 @@ def get_page(url: str, timeout: int, delay: float, retries: int, user_agent: str
                 continue
             raise
     raise RuntimeError(f"Failed to fetch {url}: {last_err}")
+
+
+def get_page(
+    url: str,
+    timeout: int,
+    delay: float,
+    retries: int,
+    user_agent: str,
+    limiter: Optional[RateLimiter] = None,
+) -> str:
+    data, _headers = _fetch_url(url, timeout, delay, retries, user_agent, limiter=limiter)
+    return data.decode("utf-8", errors="replace")
 
 
 def get_binary(
-    url: str, timeout: int, delay: float, retries: int, user_agent: str
+    url: str,
+    timeout: int,
+    delay: float,
+    retries: int,
+    user_agent: str,
+    limiter: Optional[RateLimiter] = None,
 ) -> tuple[bytes, str]:
-    last_err: Optional[BaseException] = None
-    for attempt in range(retries + 1):
-        if delay > 0:
-            time.sleep(delay)
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": user_agent,
-                "Cookie": "over18=yes",
-            },
-        )
-        ctx = ssl._create_unverified_context()
-        try:
-            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-                data = resp.read()
-                content_type = resp.headers.get("Content-Type", "")
-                return data, content_type
-        except urllib.error.HTTPError as e:
-            last_err = e
-            if e.code in (429, 500, 502, 503, 504) and attempt < retries:
-                backoff = min(8.0, (2**attempt)) + uniform(0, 0.25)
-                time.sleep(backoff)
-                continue
-            raise
-        except (urllib.error.URLError, socket.timeout, ssl.SSLError) as e:
-            last_err = e
-            if attempt < retries:
-                backoff = min(8.0, (2**attempt)) + uniform(0, 0.25)
-                time.sleep(backoff)
-                continue
-            raise
-    raise RuntimeError(f"Failed to fetch {url}: {last_err}")
+    data, headers = _fetch_url(url, timeout, delay, retries, user_agent, limiter=limiter)
+    content_type = headers.get("Content-Type", "")
+    return data, content_type
 
 
 def parse_number_range(text: str) -> Optional[tuple[int, int]]:
     raw = text.strip()
     m = re.match(r"^(\d+)\s*-\s*(\d+)$", raw)
+    if m:
+        a = int(m.group(1))
+        b = int(m.group(2))
+        if a < 1 or b < 1 or b < a:
+            return None
+        return a, b
+    m = re.match(r"^(\d+)$", raw)
     if not m:
         return None
-    a = int(m.group(1))
-    b = int(m.group(2))
-    if a < 1 or b < 1 or b < a:
+    value = int(m.group(1))
+    if value < 1:
         return None
-    return a, b
+    return value, value
 
 
-def safe_filename(name: str, default: str = "syosetu") -> str:
+def _sanitize_filename(name: str, default: str) -> str:
     name = re.sub(r'[\\/:*?"<>|]+', "", name)
     name = re.sub(r"\s+", " ", name).strip()
     name = name.rstrip(" .")
@@ -225,6 +276,30 @@ def safe_filename(name: str, default: str = "syosetu") -> str:
     if name.upper() in _WINDOWS_RESERVED_NAMES:
         name = f"_{name}"
     return name
+
+
+def _truncate_filename(name: str, max_length: int) -> str:
+    if max_length > 0 and len(name) > max_length:
+        name = name[:max_length].rstrip(" .")
+    return name
+
+
+def safe_filename(name: str, default: str = "syosetu", max_length: int = MAX_FILENAME_LEN) -> str:
+    name = _sanitize_filename(name, default)
+    name = _truncate_filename(name, max_length)
+    if not name:
+        name = default
+    if name.upper() in _WINDOWS_RESERVED_NAMES:
+        name = f"_{name}"
+    return name
+
+
+def volume_label_for_filename(volume_title: str, vol_index: int) -> str:
+    default_label = f"Volume {vol_index}"
+    sanitized = _sanitize_filename(volume_title, default_label)
+    if len(sanitized) > MAX_FILENAME_LEN:
+        return safe_filename(default_label, default_label)
+    return safe_filename(sanitized, default_label)
 
 
 def expand_path(value: str) -> Path:
@@ -275,7 +350,13 @@ def resolve_output_base(
 
     if output_path:
         out_path = expand_path(output_path)
-        if out_path.suffix:
+        seps = [os.sep]
+        if os.altsep:
+            seps.append(os.altsep)
+        has_trailing_sep = str(output_path).endswith(tuple(seps))
+        if has_trailing_sep or (out_path.exists() and out_path.is_dir()):
+            base_out_dir = out_path
+        elif out_path.suffix:
             output_name = out_path.name
             base_name = safe_filename(out_path.stem)
             if out_path.parent != Path("."):
@@ -301,6 +382,7 @@ class TocParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.title_parts: list[str] = []
         self.author_parts: list[str] = []
+        self.summary_parts: list[str] = []
         self.items: list[dict] = []
         self.next_url: str = ""
         self._remove_furigana = remove_furigana
@@ -313,6 +395,7 @@ class TocParser(HTMLParser):
         self._in_chapter_link = False
         self._chapter_parts: list[str] = []
         self._chapter_href: Optional[str] = None
+        self._summary_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         attrs_dict = dict(attrs)
@@ -320,6 +403,13 @@ class TocParser(HTMLParser):
             if self._remove_furigana:
                 self._ruby_skip_depth += 1
             return
+        if tag == "div":
+            if self._summary_depth > 0:
+                self._summary_depth += 1
+                return
+            if attrs_dict.get("id") == "novel_ex" or has_class(attrs_dict, "p-novel__summary"):
+                self._summary_depth = 1
+                return
         if tag == "h1" and has_class(attrs_dict, "p-novel__title"):
             self._in_title = True
             return
@@ -340,6 +430,9 @@ class TocParser(HTMLParser):
                 self._in_volume_title = True
                 self._volume_parts = []
             return
+        if tag == "br" and self._summary_depth > 0:
+            self.summary_parts.append("\n")
+            return
         if (
             tag == "a"
             and self._eplist_depth > 0
@@ -355,6 +448,14 @@ class TocParser(HTMLParser):
         if tag in ("rt", "rp") and self._remove_furigana:
             if self._ruby_skip_depth > 0:
                 self._ruby_skip_depth -= 1
+            return
+        if tag == "div" and self._summary_depth > 0:
+            self._summary_depth -= 1
+            if self._summary_depth == 0:
+                self.summary_parts.append("\n")
+            return
+        if tag == "p" and self._summary_depth > 0:
+            self.summary_parts.append("\n")
             return
         if tag == "h1" and self._in_title:
             self._in_title = False
@@ -393,6 +494,8 @@ class TocParser(HTMLParser):
             self.title_parts.append(normalize_japanese_punct(data))
         elif self._in_author:
             self.author_parts.append(normalize_japanese_punct(data))
+        elif self._summary_depth > 0:
+            self.summary_parts.append(normalize_japanese_punct(data))
         elif self._in_volume_title:
             self._volume_parts.append(normalize_japanese_punct(data))
         elif self._in_chapter_link:
@@ -405,6 +508,11 @@ class TocParser(HTMLParser):
         raw = "".join(self.author_parts).strip()
         raw = re.sub(r"^作者：", "", raw).strip()
         return raw
+
+    def get_summary(self) -> str:
+        raw = "".join(self.summary_parts)
+        lines = [line.strip() for line in raw.splitlines()]
+        return "\n".join([line for line in lines if line])
 
 
 class ChapterParser(HTMLParser):
@@ -454,11 +562,11 @@ class ChapterParser(HTMLParser):
             if is_text_block:
                 self._text_block_depth = 1
                 if is_preface:
-                    self._block_label_end = "__PREFACE_END__"
-                    self.paragraphs.append("__PREFACE__")
+                    self._block_label_end = MARK_PREFACE_END
+                    self.paragraphs.append(MARK_PREFACE)
                 elif is_afterword:
-                    self._block_label_end = "__AFTERWORD_END__"
-                    self.paragraphs.append("__AFTERWORD__")
+                    self._block_label_end = MARK_AFTERWORD_END
+                    self.paragraphs.append(MARK_AFTERWORD)
                 else:
                     self._block_label_end = None
             return
@@ -518,7 +626,7 @@ class ChapterParser(HTMLParser):
             if not text_content.strip() and not html_content.strip():
                 self.paragraphs.append("")
             elif is_separator_line(text_content):
-                self.paragraphs.append("__SEPARATOR__")
+                self.paragraphs.append(MARK_SEPARATOR)
             else:
                 self.paragraphs.append(html_content)
             self._in_p = False
@@ -542,11 +650,11 @@ class ChapterParser(HTMLParser):
 
 def parse_toc_page(
     page_html: str, remove_furigana: bool = False
-) -> tuple[str, str, list[dict], str]:
+) -> tuple[str, str, str, list[dict], str]:
     parser = TocParser(remove_furigana=remove_furigana)
     parser.feed(page_html)
     parser.close()
-    return parser.get_title(), parser.get_author(), parser.items, parser.next_url
+    return parser.get_title(), parser.get_author(), parser.get_summary(), parser.items, parser.next_url
 
 
 def parse_chapter_page(page_html: str, remove_furigana: bool = False) -> tuple[str, list[str]]:
@@ -566,17 +674,17 @@ def normalize_image_src(src: str, base_url: str) -> str:
     return urllib.parse.urljoin(base_url, src)
 
 
-def extract_image_sources(chapters: list[dict], base_url: str) -> list[str]:
+def extract_image_sources(chapters: list[Chapter], base_url: str) -> list[str]:
     sources: list[str] = []
     seen: set[str] = set()
     for chap in chapters:
         chap_base = chap.get("url") or base_url
         for para in chap.get("paragraphs") or []:
             if not para or para in (
-                "__PREFACE__",
-                "__PREFACE_END__",
-                "__AFTERWORD__",
-                "__AFTERWORD_END__",
+                MARK_PREFACE,
+                MARK_PREFACE_END,
+                MARK_AFTERWORD,
+                MARK_AFTERWORD_END,
             ):
                 continue
             for match in _IMG_TAG_RE.finditer(para):
@@ -622,41 +730,86 @@ def _parse_data_url(src: str) -> tuple[bytes, str]:
 
 
 def download_images(
-    chapters: list[dict],
+    chapters: list[Chapter],
     base_url: str,
     timeout: int,
     delay: float,
     retries: int,
     user_agent: str,
-) -> tuple[dict[str, str], list[dict]]:
+    jobs: int = 1,
+    limiter: Optional[RateLimiter] = None,
+) -> tuple[dict[str, str], list[ImageItem]]:
     sources = extract_image_sources(chapters, base_url)
     image_map: dict[str, str] = {}
-    images: list[dict] = []
-    counter = 1
-    for src in sources:
+    images: list[ImageItem] = []
+
+    if not sources:
+        return image_map, images
+
+    total = len(sources)
+    print(f"    Downloading {total} images...")
+
+    def fetch_one(index: int, src: str) -> tuple[int, str, Optional[bytes], str, Optional[BaseException]]:
         try:
             if src.startswith("data:"):
                 data, media_type = _parse_data_url(src)
             else:
-                data, content_type = get_binary(src, timeout, delay, retries, user_agent)
-                media_type = content_type.split(";", 1)[0].strip() or _guess_media_type_from_url(src)
+                data, content_type = get_binary(
+                    src, timeout, delay, retries, user_agent, limiter=limiter
+                )
+                media_type = content_type.split(";", 1)[0].strip() or _guess_media_type_from_url(
+                    src
+                )
             if not media_type:
                 media_type = "application/octet-stream"
-            ext = _ext_from_media_type(media_type) or ".bin"
-            filename = f"image{counter:03d}{ext}"
-            href = f"images/{filename}"
-            image_map[src] = href
-            images.append(
-                {
-                    "href": href,
-                    "media_type": media_type,
-                    "data": data,
-                }
-            )
-            counter += 1
+            return index, src, data, media_type, None
         except Exception as e:
-            print(f"    Failed to download image: {src} -> {e}")
+            return index, src, None, "", e
+
+    results: list[Optional[tuple[str, Optional[bytes], str, Optional[BaseException]]]] = [
+        None
+    ] * len(sources)
+    completed = 0
+
+    if jobs <= 1 or len(sources) <= 1:
+        for idx, src in enumerate(sources):
+            index, src, data, media_type, err = fetch_one(idx, src)
+            results[index] = (src, data, media_type, err)
+            completed += 1
+            print(f"    Downloaded {completed}/{total} images")
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            future_map = {
+                ex.submit(fetch_one, idx, src): idx for idx, src in enumerate(sources)
+            }
+            for future in as_completed(future_map):
+                index = future_map[future]
+                try:
+                    idx, src, data, media_type, err = future.result()
+                except Exception as e:
+                    results[index] = (sources[index], None, "", e)
+                    completed += 1
+                    print(f"    Downloaded {completed}/{total} images")
+                    continue
+                results[idx] = (src, data, media_type, err)
+                completed += 1
+                print(f"    Downloaded {completed}/{total} images")
+
+    counter = 1
+    for item in results:
+        if not item:
             continue
+        src, data, media_type, err = item
+        if err or data is None:
+            print(f"    Failed to download image: {src} -> {err}")
+            continue
+        ext = _ext_from_media_type(media_type) or ".bin"
+        filename = f"image{counter:03d}{ext}"
+        href = f"images/{filename}"
+        image_map[src] = href
+        images.append({"href": href, "media_type": media_type, "data": data})
+        counter += 1
+
     return image_map, images
 
 
@@ -707,13 +860,13 @@ def html_to_text(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s)
 
 
-def count_characters(chapters: list[dict]) -> int:
+def count_characters(chapters: list[Chapter]) -> int:
     total = 0
     for chap in chapters:
         title = chap.get("title") or ""
         total += len(title.replace("\n", ""))
         for para in chap.get("paragraphs") or []:
-            if para in ("__PREFACE__", "__PREFACE_END__", "__AFTERWORD__", "__AFTERWORD_END__"):
+            if para in (MARK_PREFACE, MARK_PREFACE_END, MARK_AFTERWORD, MARK_AFTERWORD_END):
                 continue
             if not para:
                 continue
@@ -724,9 +877,9 @@ def count_characters(chapters: list[dict]) -> int:
 
 def build_volumes(
     toc_items: list[dict], selected: Optional[set[str]]
-) -> tuple[list[dict], bool]:
-    volumes: list[dict] = []
-    current: Optional[dict] = None
+) -> tuple[list[Volume], bool]:
+    volumes: list[Volume] = []
+    current: Optional[Volume] = None
     vol_index = 0
     found_volume = False
     for item in toc_items:
@@ -749,7 +902,7 @@ def build_volumes(
 
 
 def build_volume_breaks(
-    volumes: list[dict], chapters: list[dict]
+    volumes: list[Volume], chapters: list[Chapter]
 ) -> list[tuple[str, int, int]]:
     index_map = {chap.get("url"): idx for idx, chap in enumerate(chapters)}
     breaks: list[tuple[str, int, int]] = []
@@ -826,13 +979,14 @@ def download_chapters(
     skip_errors: bool,
     user_agent: str,
     remove_furigana: bool,
-) -> list[dict]:
-    chapters: list[dict] = []
+    limiter: Optional[RateLimiter] = None,
+) -> list[Chapter]:
+    chapters: list[Chapter] = []
     if jobs <= 1 or len(links) <= 1:
         for idx, url in enumerate(links, start=1):
             print(f"    Downloading chapter {idx}/{len(links)}")
             try:
-                html_page = get_page(url, timeout, delay, retries, user_agent)
+                html_page = get_page(url, timeout, delay, retries, user_agent, limiter=limiter)
             except Exception as e:
                 if skip_errors:
                     print(f"    Failed: {url} -> {e}")
@@ -851,8 +1005,8 @@ def download_chapters(
             )
         return chapters
 
-    def fetch_one(index: int, url: str) -> tuple[int, dict]:
-        html_page = get_page(url, timeout, delay, retries, user_agent)
+    def fetch_one(index: int, url: str) -> tuple[int, Chapter]:
+        html_page = get_page(url, timeout, delay, retries, user_agent, limiter=limiter)
         chap_title, paragraphs = parse_chapter_page(
             html_page, remove_furigana=remove_furigana
         )
@@ -863,7 +1017,7 @@ def download_chapters(
             "url": url,
         }
 
-    results: list[Optional[dict]] = [None] * len(links)
+    results: list[Optional[Chapter]] = [None] * len(links)
     errors: list[tuple[str, BaseException]] = []
     completed = 0
     with ThreadPoolExecutor(max_workers=jobs) as ex:
@@ -892,7 +1046,7 @@ def download_chapters(
     return [c for c in results if c is not None]
 
 
-def write_txt(path: str, title: str, author: str, chapters: list[dict], book_url: str) -> None:
+def write_txt(path: str, title: str, author: str, chapters: list[Chapter], book_url: str) -> None:
     def append_block(lines: list[str], block: tuple[str, ...]) -> None:
         if not block:
             return
@@ -912,11 +1066,11 @@ def write_txt(path: str, title: str, author: str, chapters: list[dict], book_url
         lines.extend(block)
 
     section_map = {
-        "__PREFACE__": (SEPARATOR_LINE, "", "前書き", ""),
-        "__AFTERWORD__": (SEPARATOR_LINE, "", "後書き", ""),
-        "__PREFACE_END__": (SEPARATOR_LINE,),
-        "__AFTERWORD_END__": (SEPARATOR_LINE,),
-        "__SEPARATOR__": (SEPARATOR_LINE,),
+        MARK_PREFACE: (SEPARATOR_LINE, "", "前書き", ""),
+        MARK_AFTERWORD: (SEPARATOR_LINE, "", "後書き", ""),
+        MARK_PREFACE_END: (SEPARATOR_LINE,),
+        MARK_AFTERWORD_END: (SEPARATOR_LINE,),
+        MARK_SEPARATOR: (SEPARATOR_LINE,),
     }
 
     out_lines: list[str] = []
@@ -937,7 +1091,7 @@ def write_txt(path: str, title: str, author: str, chapters: list[dict], book_url
                 out_lines.append("")
                 continue
             clean = replace_img_tags_for_txt(para, chap_base)
-            out_lines.append(html_to_text(clean))
+            out_lines.append(html.unescape(html_to_text(clean)))
         out_lines.append("")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(out_lines).strip() + "\n")
@@ -947,11 +1101,12 @@ def build_epub2(
     path: str,
     title: str,
     author: str,
-    chapters: list[dict],
+    summary: str,
+    chapters: list[Chapter],
     book_url: str,
     volume_breaks: Optional[list[tuple[str, int, int]]] = None,
     image_map: Optional[dict[str, str]] = None,
-    image_items: Optional[list[dict]] = None,
+    image_items: Optional[list[ImageItem]] = None,
     vertical_text: bool = False,
 ) -> None:
     book_id = f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, book_url)}"
@@ -989,6 +1144,7 @@ def build_epub2(
         "h1{font-size:1.4em;margin:1.2em 0 0.6em 0;}"
         "p{margin:0 0 0.8em 0;}"
         "p.blank{margin:0 0 0.8em 0;}"
+        "p.summary{margin:0 0 0.8em 0;}"
         "img{max-width:100%;height:auto;}"
         ".toc ol{list-style:none;padding-left:0;}"
         ".toc li{margin:0 0 0.4em 0;}"
@@ -1009,21 +1165,27 @@ def build_epub2(
     title_lines.append(
         f'  <p>リンク：<a href="{esc(link_url)}">{esc(link_url)}</a></p>'
     )
+    if summary:
+        title_lines.append('  <p class="blank">&#160;</p>')
+        for line in summary.splitlines():
+            if not line.strip():
+                continue
+            title_lines.append(f'  <p class="summary">{esc(line.strip())}</p>')
     title_xhtml = xhtml_doc(title, "\n".join(title_lines))
 
     marker_map = {
-        "__PREFACE__": (
+        MARK_PREFACE: (
             '<p class="blank">&#160;</p>',
             '<p class="section-marker preface">前書き</p>',
             '<p class="blank">&#160;</p>',
         ),
-        "__AFTERWORD__": (
+        MARK_AFTERWORD: (
             '<p class="section-marker afterword">後書き</p>',
             '<p class="blank">&#160;</p>',
         ),
-        "__PREFACE_END__": ('<hr class="separator" />',),
-        "__AFTERWORD_END__": ('<hr class="separator" />',),
-        "__SEPARATOR__": ('<hr class="separator" />',),
+        MARK_PREFACE_END: ('<hr class="separator" />',),
+        MARK_AFTERWORD_END: ('<hr class="separator" />',),
+        MARK_SEPARATOR: ('<hr class="separator" />',),
     }
 
     chapter_files: list[tuple[str, str]] = []
@@ -1239,7 +1401,7 @@ def build_epub2(
 </container>
 """
 
-    with zipfile.ZipFile(path, "w") as zf:
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
         zf.writestr("META-INF/container.xml", container_xml)
         zf.writestr("OEBPS/content.opf", opf)
@@ -1259,7 +1421,15 @@ def build_epub2(
 
 
 def write_output(
-    path: str, title: str, author: str, chapters: list[dict], fmt: str, book_url: str,
+    path: str,
+    title: str,
+    author: str,
+    summary: str,
+    chapters: list[Chapter],
+    fmt: str,
+    book_url: str,
+    jobs: int,
+    limiter: Optional[RateLimiter] = None,
     volume_breaks: Optional[list[tuple[str, int, int]]] = None,
     vertical_text: bool = False,
 ) -> None:
@@ -1274,11 +1444,14 @@ def write_output(
             DEFAULT_DELAY,
             DEFAULT_RETRIES,
             UA,
+            jobs=jobs,
+            limiter=limiter,
         )
         build_epub2(
             path_str,
             title,
             author,
+            summary,
             chapters,
             book_url,
             volume_breaks=volume_breaks,
@@ -1323,6 +1496,7 @@ def main() -> None:
     )
     p.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help="Parallel download jobs")
     args = p.parse_args()
+    rate_limiter = RateLimiter(DEFAULT_DELAY)
 
     config = load_config(CONFIG_PATH)
     config_output_dir: Optional[str] = None
@@ -1346,7 +1520,6 @@ def main() -> None:
         print("Note: --vertical only applies to EPUB output.")
 
     input_url = args.book_url.rstrip("/")
-    display_link_url = input_url
     chapter_match = re.match(
         r"^https?://[^/]*syosetu\.com/([^/]+)/(\d+)/?$",
         input_url,
@@ -1362,16 +1535,21 @@ def main() -> None:
     else:
         main_url = input_url
 
+    if not main_url.endswith("/"):
+        main_url = f"{main_url}/"
+    book_url = main_url.replace("http://", "https://", 1)
+
     for name, value, min_value in (("jobs", args.jobs, 1),):
         if value < min_value:
             print(f"--{name} must be >= {min_value}")
             return
 
     print("Downloading table of contents...")
-    next_url = main_url
+    next_url = book_url
     page_num = 1
     title = ""
     author = ""
+    summary = ""
     toc_items: list[dict] = []
     seen_links: set[str] = set()
     seen_pages: set[str] = set()
@@ -1382,17 +1560,26 @@ def main() -> None:
         print(f"    Page {page_num}...")
         page_url = next_url
         try:
-            page = get_page(page_url, DEFAULT_TIMEOUT, DEFAULT_DELAY, DEFAULT_RETRIES, UA)
+            page = get_page(
+                page_url,
+                DEFAULT_TIMEOUT,
+                DEFAULT_DELAY,
+                DEFAULT_RETRIES,
+                UA,
+                limiter=rate_limiter,
+            )
         except Exception as e:
             print(f"Failed to fetch TOC page: {e}")
             return
-        page_title, page_author, items, page_next = parse_toc_page(
+        page_title, page_author, page_summary, items, page_next = parse_toc_page(
             page, remove_furigana=args.remove_furigana
         )
         if not title and page_title:
             title = page_title
         if not author and page_author:
             author = page_author
+        if not summary and page_summary:
+            summary = page_summary
         for item in items:
             item_type = item.get("type")
             if item_type == "volume":
@@ -1494,7 +1681,7 @@ def main() -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         volume_stats: list[tuple[int, str, int]] = []
-        merged_chapters: list[dict] = []
+        merged_chapters: list[Chapter] = []
         volume_breaks: list[tuple[str, int, int]] = []
 
         for vol_index, volume in selected_volumes:
@@ -1511,6 +1698,7 @@ def main() -> None:
                 DEFAULT_SKIP_ERRORS,
                 UA,
                 args.remove_furigana,
+                limiter=rate_limiter,
             )
             volume_stats.append((vol_index, volume_title, count_characters(chapters)))
             start_index = len(merged_chapters)
@@ -1521,7 +1709,7 @@ def main() -> None:
             display_title = title
             if found_volume or len(volumes) > 1:
                 display_title = f"{title} - {volume_title}"
-            volume_label = safe_filename(volume_title, f"Volume {vol_index}")
+            volume_label = volume_label_for_filename(volume_title, vol_index)
             if len(chapters) == 1:
                 chap_label = safe_filename(chapters[0].get("title") or "Chapter 1")
                 filename = f"{base_name} - {volume_label} - {chap_label}.{args.format}"
@@ -1532,9 +1720,12 @@ def main() -> None:
                 out_path,
                 display_title,
                 author,
+                summary,
                 chapters,
                 args.format,
-                display_link_url,
+                book_url,
+                args.jobs,
+                limiter=rate_limiter,
                 vertical_text=args.vertical_text,
             )
             print(f"\nWrote {out_path}")
@@ -1556,9 +1747,12 @@ def main() -> None:
                         out_path,
                         complete_title,
                         author,
+                        summary,
                         merged_chapters,
                         args.format,
-                        display_link_url,
+                        book_url,
+                        args.jobs,
+                        limiter=rate_limiter,
                         volume_breaks=volume_breaks,
                         vertical_text=args.vertical_text,
                     )
@@ -1586,6 +1780,7 @@ def main() -> None:
             DEFAULT_SKIP_ERRORS,
             UA,
             args.remove_furigana,
+            limiter=rate_limiter,
         )
         if output_name:
             out_path = out_dir / output_name
@@ -1601,9 +1796,12 @@ def main() -> None:
             out_path,
             title,
             author,
+            summary,
             chapters,
             args.format,
-            display_link_url,
+            book_url,
+            args.jobs,
+            limiter=rate_limiter,
             volume_breaks=volume_breaks,
             vertical_text=args.vertical_text,
         )

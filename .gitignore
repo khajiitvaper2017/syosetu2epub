@@ -1,1 +1,5 @@
-AGENTS.md
+*
+!/.gitignore
+!/LICENSE
+!/README.md
+!/syosetu2epub.py
