@@ -14,6 +14,7 @@ So I asked Codex to convert it to python and then heavily modified it to my need
 - Select chapter ranges or specific volumes.
 - Optional furigana (ruby) removal.
 - Normalizes ASCII punctuation and digits to Japanese full-width forms in text.
+- (EPUB only) Converts scene-break lines made of dashes or asterisks (e.g., `＊`) into separators and collapses extra blank lines around them.
 - Preserves preface (前書き / maegaki) and afterword (後書き / atogaki) sections.
 - Parallel chapter and image downloads with `--jobs`.
 - Embeds images in EPUB and includes image placeholders in TXT.
@@ -40,6 +41,7 @@ python syosetu2epub.py --output-dir <folder>
 - `-c, --chapters` Chapter selection: `N` or `N-M` (1-based, inclusive).
 - `-v, --volume, --volumes` Volume selection such as `1,3-4` or `all` (when the TOC has volume headings).
 - `--remove-furigana, --no-furigana` Remove ruby annotations from the output.
+- `--no-separator` (EPUB only) Keep scene-break lines (dashes/asterisks) as-is instead of converting them to separators.
 - `--vertical, --vertical-text` Render EPUB in vertical writing mode (tategaki).
 - `--jobs` Parallel download jobs (default: 10).
 

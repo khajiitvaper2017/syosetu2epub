@@ -95,6 +95,7 @@ _IMG_EXT_BY_MIME = {
     "image/svg+xml": ".svg",
 }
 _SEPARATOR_CHARS = "-_－＿—–―ｰー─━"
+_SEPARATOR_SYMBOLS = "*＊"
 
 
 class Chapter(TypedDict):
@@ -154,9 +155,94 @@ def translate_japanese_punct(text: str) -> str:
 
 def is_separator_line(text: str) -> bool:
     compact = "".join(ch for ch in text if not ch.isspace())
-    if len(compact) < 4:
+    if not compact:
         return False
-    return all(ch in _SEPARATOR_CHARS for ch in compact)
+    if all(ch in _SEPARATOR_CHARS for ch in compact):
+        return len(compact) >= 4
+    if all(ch in _SEPARATOR_SYMBOLS for ch in compact):
+        return True
+    return False
+
+
+def normalize_separator_spacing(paragraphs: list[str]) -> list[str]:
+    if not paragraphs:
+        return paragraphs
+    markers = {
+        MARK_PREFACE,
+        MARK_PREFACE_END,
+        MARK_AFTERWORD,
+        MARK_AFTERWORD_END,
+        MARK_SEPARATOR,
+    }
+
+    def is_blank_para(para: str) -> bool:
+        if para == "":
+            return True
+        if para in markers:
+            return False
+        if "<img" in para:
+            return False
+        text = html.unescape(html_to_text(para))
+        return not text.strip()
+
+    out: list[str] = []
+    i = 0
+    total = len(paragraphs)
+    while i < total:
+        para = paragraphs[i]
+        if para != MARK_SEPARATOR:
+            out.append(para)
+            i += 1
+            continue
+        while out and is_blank_para(out[-1]):
+            out.pop()
+        if out:
+            out.append("")
+        out.append(para)
+        i += 1
+        while i < total and is_blank_para(paragraphs[i]):
+            i += 1
+        if i < total:
+            out.append("")
+        continue
+    return out
+
+
+def apply_separator_handling(paragraphs: list[str]) -> list[str]:
+    if not paragraphs:
+        return paragraphs
+    markers = {
+        MARK_PREFACE,
+        MARK_PREFACE_END,
+        MARK_AFTERWORD,
+        MARK_AFTERWORD_END,
+        MARK_SEPARATOR,
+    }
+    out: list[str] = []
+    for para in paragraphs:
+        if para in markers or para == "":
+            out.append(para)
+            continue
+        text = html.unescape(html_to_text(para))
+        if is_separator_line(text):
+            out.append(MARK_SEPARATOR)
+        else:
+            out.append(para)
+    return normalize_separator_spacing(out)
+
+
+def apply_separator_handling_to_chapters(chapters: list[Chapter]) -> list[Chapter]:
+    out: list[Chapter] = []
+    for chap in chapters:
+        paragraphs = apply_separator_handling(chap.get("paragraphs") or [])
+        out.append(
+            {
+                "title": chap.get("title") or "",
+                "paragraphs": paragraphs,
+                "url": chap.get("url") or "",
+            }
+        )
+    return out
 
 
 class RateLimiter:
@@ -625,8 +711,6 @@ class ChapterParser(HTMLParser):
             text_content = "".join(self._current_text_parts)
             if not text_content.strip() and not html_content.strip():
                 self.paragraphs.append("")
-            elif is_separator_line(text_content):
-                self.paragraphs.append(MARK_SEPARATOR)
             else:
                 self.paragraphs.append(html_content)
             self._in_p = False
@@ -1429,6 +1513,7 @@ def write_output(
     fmt: str,
     book_url: str,
     jobs: int,
+    handle_separators: bool,
     limiter: Optional[RateLimiter] = None,
     volume_breaks: Optional[list[tuple[str, int, int]]] = None,
     vertical_text: bool = False,
@@ -1437,6 +1522,8 @@ def write_output(
     if fmt == "txt":
         write_txt(path_str, title, author, chapters, book_url)
     else:
+        if handle_separators:
+            chapters = apply_separator_handling_to_chapters(chapters)
         image_map, image_items = download_images(
             chapters,
             book_url,
@@ -1492,6 +1579,12 @@ def main() -> None:
         help="Remove furigana (ruby annotations) from output.",
     )
     p.add_argument(
+        "--no-separator",
+        dest="handle_separators",
+        action="store_false",
+        help="EPUB only: keep separator lines as-is (do not convert to separators).",
+    )
+    p.add_argument(
         "--vertical",
         "--vertical-text",
         dest="vertical_text",
@@ -1499,6 +1592,7 @@ def main() -> None:
         help="Render EPUB in vertical writing mode (tategaki).",
     )
     p.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help="Parallel download jobs")
+    p.set_defaults(handle_separators=True)
     args = p.parse_args()
     rate_limiter = RateLimiter(DEFAULT_DELAY)
 
@@ -1736,6 +1830,7 @@ def main() -> None:
                 args.format,
                 book_url,
                 args.jobs,
+                args.handle_separators,
                 limiter=rate_limiter,
                 vertical_text=args.vertical_text,
             )
@@ -1763,6 +1858,7 @@ def main() -> None:
                         args.format,
                         book_url,
                         args.jobs,
+                        args.handle_separators,
                         limiter=rate_limiter,
                         volume_breaks=volume_breaks,
                         vertical_text=args.vertical_text,
@@ -1812,6 +1908,7 @@ def main() -> None:
             args.format,
             book_url,
             args.jobs,
+            args.handle_separators,
             limiter=rate_limiter,
             volume_breaks=volume_breaks,
             vertical_text=args.vertical_text,
