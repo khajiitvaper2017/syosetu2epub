@@ -38,7 +38,7 @@ python syosetu2epub.py --output-dir <folder>
 **Options**
 - `-o, --output` Output path. If a filename is provided, that name is used inside the novel's output folder. If a directory is provided, outputs are written under that directory.
 - `--output-dir, --output-folder` Set the default base output folder and save it to config (used when `--output` is not provided). Can be used without `book_url`.
-- `-f, --format` Output format: `epub` or `txt` (default: `epub`).
+- `-f, --format` Output format: `epub`, `txt`, or `both` (default: `epub`).
 - `-c, --chapters` Chapter selection: `N` or `N-M` (1-based, inclusive).
 - `-v, --volume, --volumes` Volume selection such as `1,3-4` or `all` (when the TOC has volume headings).
 - `--remove-furigana, --no-furigana` Remove ruby annotations from the output.

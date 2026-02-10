@@ -1586,7 +1586,7 @@ def main() -> None:
         dest="output_dir",
         help="Default base output folder (saved in config).",
     )
-    p.add_argument("-f", "--format", choices=("epub", "txt"), default="epub")
+    p.add_argument("-f", "--format", choices=("epub", "txt", "both"), default="epub")
     p.add_argument("-c", "--chapters", help="Chapter range N-M (1-based)")
     p.add_argument(
         "-v",
@@ -1645,7 +1645,8 @@ def main() -> None:
         print("Missing book_url. Provide a URL or use --output-dir to set the default output folder.")
         return
 
-    if args.vertical_text and args.format == "txt":
+    formats = ("epub", "txt") if args.format == "both" else (args.format,)
+    if args.vertical_text and "epub" not in formats:
         print("Note: --vertical only applies to EPUB output.")
 
     input_url = args.book_url.rstrip("/")
@@ -1870,26 +1871,29 @@ def main() -> None:
             if found_volume or len(volumes) > 1:
                 display_title = f"{title} - {volume_title}"
             volume_label = volume_label_for_filename(volume_title, vol_index)
+            chap_label = None
             if len(chapters) == 1:
                 chap_label = safe_filename(chapters[0].get("title") or "Chapter 1")
-                filename = f"{base_name} - {volume_label} - {chap_label}.{args.format}"
-            else:
-                filename = f"{base_name} - {volume_label}.{args.format}"
-            out_path = out_dir / filename
-            write_output(
-                out_path,
-                display_title,
-                author,
-                summary,
-                chapters,
-                args.format,
-                book_url,
-                args.jobs,
-                args.handle_separators,
-                limiter=rate_limiter,
-                vertical_text=args.vertical_text,
-            )
-            print(f"\nWrote {out_path}")
+            for fmt in formats:
+                if chap_label:
+                    filename = f"{base_name} - {volume_label} - {chap_label}.{fmt}"
+                else:
+                    filename = f"{base_name} - {volume_label}.{fmt}"
+                out_path = out_dir / filename
+                write_output(
+                    out_path,
+                    display_title,
+                    author,
+                    summary,
+                    chapters,
+                    fmt,
+                    book_url,
+                    args.jobs,
+                    args.handle_separators,
+                    limiter=rate_limiter,
+                    vertical_text=args.vertical_text,
+                )
+                print(f"\nWrote {out_path}")
 
         if volume_stats:
             print("\nCharacter counts by volume:")
@@ -1897,7 +1901,7 @@ def main() -> None:
                 label = f"{vol_index:02d} - {volume_title}"
                 print(f"  {label}: {char_count}")
 
-        if args.format == "epub" and len(volume_breaks) > 1:
+        if "epub" in formats and len(volume_breaks) > 1:
             if sys.stdin.isatty():
                 print("\nMerge selected volumes into a single EPUB now? [y/N]")
                 choice = input().strip().lower()
@@ -1910,7 +1914,7 @@ def main() -> None:
                         author,
                         summary,
                         merged_chapters,
-                        args.format,
+                        "epub",
                         book_url,
                         args.jobs,
                         args.handle_separators,
@@ -1947,32 +1951,45 @@ def main() -> None:
                 args.remove_furigana,
                 limiter=rate_limiter,
             )
+        output_stem = None
         if output_name:
-            out_path = out_dir / output_name
-        else:
-            if len(chapters) == 1:
-                chap_label = safe_filename(chapters[0].get("title") or "Chapter 1")
-                filename = f"{base_name} - {chap_label}.{args.format}"
-            else:
-                filename = f"{base_name}.{args.format}"
-            out_path = out_dir / filename
-        volume_breaks = build_volume_breaks(volumes, chapters) if found_volume and args.format == "epub" else None
-        write_output(
-            out_path,
-            title,
-            author,
-            summary,
-            chapters,
-            args.format,
-            book_url,
-            args.jobs,
-            args.handle_separators,
-            limiter=rate_limiter,
-            volume_breaks=volume_breaks,
-            vertical_text=args.vertical_text,
+            output_stem = output_name
+            if args.format == "both":
+                suffix = Path(output_name).suffix
+                output_stem = Path(output_name).stem if suffix else output_name
+        chap_label = None
+        if len(chapters) == 1:
+            chap_label = safe_filename(chapters[0].get("title") or "Chapter 1")
+        volume_breaks = (
+            build_volume_breaks(volumes, chapters) if found_volume and "epub" in formats else None
         )
-
-        print(f"\nWrote {out_path}")
+        for fmt in formats:
+            if output_stem is not None:
+                if args.format == "both":
+                    filename = f"{output_stem}.{fmt}"
+                else:
+                    filename = output_stem
+            else:
+                if chap_label:
+                    filename = f"{base_name} - {chap_label}.{fmt}"
+                else:
+                    filename = f"{base_name}.{fmt}"
+            out_path = out_dir / filename
+            write_output(
+                out_path,
+                title,
+                author,
+                summary,
+                chapters,
+                fmt,
+                book_url,
+                args.jobs,
+                args.handle_separators,
+                limiter=rate_limiter,
+                volume_breaks=volume_breaks if fmt == "epub" else None,
+                vertical_text=args.vertical_text,
+            )
+            print(f"\nWrote {out_path}")
 
 
 if __name__ == "__main__":
