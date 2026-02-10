@@ -1130,7 +1130,13 @@ def download_chapters(
     return [c for c in results if c is not None]
 
 
-def write_txt(path: str, title: str, author: str, chapters: list[Chapter], book_url: str) -> None:
+def write_txt(
+    path: str,
+    title: str,
+    author: str,
+    chapters: list[Chapter],
+    book_url: str,
+) -> None:
     def append_block(lines: list[str], block: tuple[str, ...]) -> None:
         if not block:
             return
@@ -1162,9 +1168,16 @@ def write_txt(path: str, title: str, author: str, chapters: list[Chapter], book_
     if author:
         out_lines.append(f"作者：{author}")
     out_lines.append("")
+    skip_single_title = False
+    if len(chapters) == 1:
+        chap_title = (chapters[0].get("title") or "").strip()
+        chap_url = (chapters[0].get("url") or "").rstrip("/")
+        if chap_title == title.strip() and chap_url == book_url.rstrip("/"):
+            skip_single_title = True
     for chap in chapters:
-        out_lines.append(chap["title"])
-        out_lines.append("")
+        if not skip_single_title:
+            out_lines.append(chap["title"])
+            out_lines.append("")
         chap_base = chap.get("url") or book_url
         for para in chap["paragraphs"]:
             section = section_map.get(para)
@@ -1175,7 +1188,9 @@ def write_txt(path: str, title: str, author: str, chapters: list[Chapter], book_
                 out_lines.append("")
                 continue
             clean = replace_img_tags_for_txt(para, chap_base)
-            out_lines.append(html.unescape(html_to_text(clean)))
+            text = html.unescape(html_to_text(clean))
+            for line in text.split("\n"):
+                out_lines.append(line)
         out_lines.append("")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(out_lines).strip() + "\n")
@@ -1273,6 +1288,12 @@ def build_epub2(
     }
 
     chapter_files: list[tuple[str, str]] = []
+    skip_single_title = False
+    if len(chapters) == 1:
+        chap_title = (chapters[0].get("title") or "").strip()
+        chap_url = (chapters[0].get("url") or "").rstrip("/")
+        if chap_title == title.strip() and chap_url == book_url.rstrip("/"):
+            skip_single_title = True
     for idx, chap in enumerate(chapters, start=1):
         chap_title = chap["title"] or f"Chapter {idx}"
         anchor_id = f"ref-{idx:03d}"
@@ -1293,7 +1314,10 @@ def build_epub2(
                     text = ensure_image_breaks(text)
                 paras.append(f"<p>{text}</p>")
         body_html = "\n  ".join(paras) if paras else "<p></p>"
-        chap_body = f'  <h1 id="{anchor_id}">{esc(chap_title)}</h1>\n  {body_html}'
+        if skip_single_title and idx == 1:
+            chap_body = f'  <a id="{anchor_id}"></a>\n  {body_html}'
+        else:
+            chap_body = f'  <h1 id="{anchor_id}">{esc(chap_title)}</h1>\n  {body_html}'
         chap_xhtml = xhtml_doc(chap_title, chap_body)
         filename = f"chapter{idx:03d}.xhtml"
         chapter_files.append((filename, chap_xhtml))
@@ -1652,6 +1676,8 @@ def main() -> None:
     print("Downloading table of contents...")
     next_url = book_url
     page_num = 1
+    first_page_html = ""
+    first_page_url = ""
     title = ""
     author = ""
     summary = ""
@@ -1676,6 +1702,9 @@ def main() -> None:
         except Exception as e:
             print(f"Failed to fetch TOC page: {e}")
             return
+        if page_num == 1:
+            first_page_html = page
+            first_page_url = page_url
         page_title, page_author, page_summary, items, page_next = parse_toc_page(
             page, remove_furigana=args.remove_furigana
         )
@@ -1724,6 +1753,32 @@ def main() -> None:
         print(f"作者：{author}")
 
     chapter_links = [item["href"] for item in toc_items if item.get("type") == "chapter"]
+    one_shot_chapter: Optional[Chapter] = None
+    if not chapter_links and first_page_html:
+        chap_title, paragraphs = parse_chapter_page(
+            first_page_html,
+            remove_furigana=args.remove_furigana,
+        )
+        has_content = any(
+            para not in (
+                MARK_PREFACE,
+                MARK_PREFACE_END,
+                MARK_AFTERWORD,
+                MARK_AFTERWORD_END,
+                MARK_SEPARATOR,
+            )
+            and para.strip()
+            for para in paragraphs
+        )
+        if has_content:
+            one_shot_url = first_page_url or book_url
+            chap_title = chap_title or title or "Chapter 1"
+            one_shot_chapter = {
+                "title": chap_title,
+                "paragraphs": paragraphs,
+                "url": one_shot_url,
+            }
+            chapter_links = [one_shot_url]
     if not chapter_links:
         print("No chapters found.")
         return
@@ -1878,17 +1933,20 @@ def main() -> None:
         )
         out_dir = base_out_dir / safe_filename(title)
         out_dir.mkdir(parents=True, exist_ok=True)
-        chapters = download_chapters(
-            selected_links,
-            DEFAULT_TIMEOUT,
-            DEFAULT_DELAY,
-            DEFAULT_RETRIES,
-            args.jobs,
-            DEFAULT_SKIP_ERRORS,
-            UA,
-            args.remove_furigana,
-            limiter=rate_limiter,
-        )
+        if one_shot_chapter and selected_links == [one_shot_chapter["url"]]:
+            chapters = [one_shot_chapter]
+        else:
+            chapters = download_chapters(
+                selected_links,
+                DEFAULT_TIMEOUT,
+                DEFAULT_DELAY,
+                DEFAULT_RETRIES,
+                args.jobs,
+                DEFAULT_SKIP_ERRORS,
+                UA,
+                args.remove_furigana,
+                limiter=rate_limiter,
+            )
         if output_name:
             out_path = out_dir / output_name
         else:

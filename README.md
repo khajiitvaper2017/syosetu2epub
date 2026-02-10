@@ -11,6 +11,7 @@ So I asked Codex to convert it to python and then heavily modified it to my need
 **Features**
 - EPUB2 or TXT output.
 - Supports multi-page TOCs and volume headings.
+- Supports one-shot (single-page) novels without a chapter list.
 - Select chapter ranges or specific volumes.
 - Optional furigana (ruby) removal.
 - Normalizes ASCII punctuation and digits to Japanese full-width forms in text.
