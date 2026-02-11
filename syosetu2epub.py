@@ -245,6 +245,23 @@ def apply_separator_handling_to_chapters(chapters: list[Chapter]) -> list[Chapte
     return out
 
 
+def chapter_ends_with_separator(paragraphs: list[str]) -> bool:
+    separator_markers = {MARK_SEPARATOR, MARK_PREFACE_END, MARK_AFTERWORD_END}
+    non_content_markers = {MARK_PREFACE, MARK_AFTERWORD}
+    for para in reversed(paragraphs):
+        if para == "":
+            continue
+        if para in separator_markers:
+            return True
+        if para in non_content_markers:
+            return False
+        text = html.unescape(html_to_text(para))
+        if not text.strip():
+            continue
+        return is_separator_line(text)
+    return False
+
+
 class RateLimiter:
     def __init__(self, min_interval: float) -> None:
         self.min_interval = max(0.0, min_interval)
@@ -1142,7 +1159,7 @@ def write_txt(
             return
         if block[0] == SEPARATOR_LINE:
             last = next((ln for ln in reversed(lines) if ln != ""), "")
-            if last == SEPARATOR_LINE:
+            if last == SEPARATOR_LINE or is_separator_line(last):
                 block = block[1:]
                 if not block:
                     return
@@ -1176,8 +1193,7 @@ def write_txt(
             skip_single_title = True
     for chap in chapters:
         if not skip_single_title:
-            out_lines.append(chap["title"])
-            out_lines.append("")
+            append_block(out_lines, (SEPARATOR_LINE, "", chap["title"], ""))
         chap_base = chap.get("url") or book_url
         for para in chap["paragraphs"]:
             section = section_map.get(para)
@@ -1286,6 +1302,15 @@ def build_epub2(
         MARK_AFTERWORD_END: ('<hr class="separator" />',),
         MARK_SEPARATOR: ('<hr class="separator" />',),
     }
+    separator_html = '<hr class="separator" />'
+    blank_html = '<p class="blank">&#160;</p>'
+
+    def append_html(paras: list[str], block: str) -> None:
+        if block == separator_html:
+            last_nonblank = next((item for item in reversed(paras) if item != blank_html), "")
+            if last_nonblank == separator_html:
+                return
+        paras.append(block)
 
     chapter_files: list[tuple[str, str]] = []
     skip_single_title = False
@@ -1302,22 +1327,31 @@ def build_epub2(
         for para in chap["paragraphs"]:
             marker = marker_map.get(para)
             if marker:
-                paras.extend(marker)
+                for block in marker:
+                    append_html(paras, block)
                 continue
             if para == "":
-                paras.append('<p class="blank">&#160;</p>')
+                append_html(paras, blank_html)
             else:
                 text = para.replace("\n", "<br />")
                 if image_map:
                     text = replace_img_srcs(text, chap_base, image_map)
                 if "<img" in text:
                     text = ensure_image_breaks(text)
-                paras.append(f"<p>{text}</p>")
+                append_html(paras, f"<p>{text}</p>")
         body_html = "\n  ".join(paras) if paras else "<p></p>"
         if skip_single_title and idx == 1:
             chap_body = f'  <a id="{anchor_id}"></a>\n  {body_html}'
         else:
-            chap_body = f'  <h1 id="{anchor_id}">{esc(chap_title)}</h1>\n  {body_html}'
+            add_title_separator = True
+            if idx > 1 and chapter_ends_with_separator(chapters[idx - 2].get("paragraphs") or []):
+                add_title_separator = False
+            title_parts: list[str] = []
+            if add_title_separator:
+                title_parts.append(separator_html)
+            title_parts.append(f'<h1 id="{anchor_id}">{esc(chap_title)}</h1>')
+            title_html = "\n  ".join(title_parts)
+            chap_body = f"  {title_html}\n  {body_html}"
         chap_xhtml = xhtml_doc(chap_title, chap_body)
         filename = f"chapter{idx:03d}.xhtml"
         chapter_files.append((filename, chap_xhtml))
