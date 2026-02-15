@@ -9,6 +9,7 @@ import ssl
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -81,6 +82,7 @@ _JP_DIGIT_MAP = {
 }
 _JP_TEXT_TRANSLATION = str.maketrans({**_JP_PUNCT_MAP, **_JP_DIGIT_MAP})
 _URL_RE = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+_BRANCH_TITLE_QUOTE_RE = re.compile(r"『([^』]+)』")
 _IMG_TAG_RE = re.compile(
     r"<img\b[^>]*?\bsrc\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s>]+))[^>]*>",
     re.IGNORECASE,
@@ -961,6 +963,61 @@ def html_to_text(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s)
 
 
+def normalize_branch_target(text: str) -> str:
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKC", text)
+    for dash in ("‐", "‑", "–", "—", "―", "−", "ー", "－"):
+        normalized = normalized.replace(dash, "-")
+    normalized = normalized.replace("～", "~")
+    normalized = re.sub(r"\s+", "", normalized)
+    return normalized.casefold()
+
+
+def build_branch_target_href_map(chapters: list[Chapter]) -> dict[str, str]:
+    href_map: dict[str, str] = {}
+    for idx, chap in enumerate(chapters, start=1):
+        title = chap.get("title") or f"Chapter {idx}"
+        key = normalize_branch_target(title)
+        if not key or key in href_map:
+            continue
+        href_map[key] = f"chapter{idx:03d}.xhtml#ref-{idx:03d}"
+    return href_map
+
+
+def looks_like_branch_navigation_line(html_text: str) -> bool:
+    if "→" not in html_text or "『" not in html_text or "』" not in html_text:
+        return False
+    plain = html.unescape(html_to_text(html_text))
+    return plain.lstrip().startswith("→")
+
+
+def resolve_branch_target_href(target_key: str, href_map: Mapping[str, str]) -> Optional[str]:
+    exact = href_map.get(target_key)
+    if exact:
+        return exact
+    for chapter_key, href in href_map.items():
+        if chapter_key.startswith(target_key):
+            return href
+    return None
+
+
+def auto_link_branch_targets(html_text: str, href_map: Mapping[str, str]) -> str:
+    if not href_map or not looks_like_branch_navigation_line(html_text):
+        return html_text
+
+    def repl(match: re.Match[str]) -> str:
+        target_raw = html.unescape(match.group(1)).strip()
+        key = normalize_branch_target(target_raw)
+        href = resolve_branch_target_href(key, href_map)
+        if not href:
+            return match.group(0)
+        safe_href = html.escape(href, quote=True)
+        return f'『<a href="{safe_href}">{match.group(1)}</a>』'
+
+    return _BRANCH_TITLE_QUOTE_RE.sub(repl, html_text)
+
+
 def count_characters(chapters: list[Chapter]) -> int:
     total = 0
     for chap in chapters:
@@ -1223,6 +1280,7 @@ def build_epub2(
     image_map: Optional[dict[str, str]] = None,
     image_items: Optional[list[ImageItem]] = None,
     vertical_text: bool = False,
+    auto_branch_links: bool = True,
 ) -> None:
     book_id = f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, book_url)}"
     lang = "ja"
@@ -1312,6 +1370,8 @@ def build_epub2(
                 return
         paras.append(block)
 
+    branch_href_map = build_branch_target_href_map(chapters) if auto_branch_links else {}
+
     chapter_files: list[tuple[str, str]] = []
     skip_single_title = False
     if len(chapters) == 1:
@@ -1334,6 +1394,8 @@ def build_epub2(
                 append_html(paras, blank_html)
             else:
                 text = para.replace("\n", "<br />")
+                if branch_href_map:
+                    text = auto_link_branch_targets(text, branch_href_map)
                 if image_map:
                     text = replace_img_srcs(text, chap_base, image_map)
                 if "<img" in text:
@@ -1575,6 +1637,7 @@ def write_output(
     limiter: Optional[RateLimiter] = None,
     volume_breaks: Optional[list[tuple[str, int, int]]] = None,
     vertical_text: bool = False,
+    auto_branch_links: bool = True,
 ) -> None:
     path_str = str(path)
     if fmt == "txt":
@@ -1603,6 +1666,7 @@ def write_output(
             image_map=image_map,
             image_items=image_items,
             vertical_text=vertical_text,
+            auto_branch_links=auto_branch_links,
         )
 
 
@@ -1649,8 +1713,14 @@ def main() -> None:
         action="store_true",
         help="Render EPUB in vertical writing mode (tategaki).",
     )
+    p.add_argument(
+        "--no-branch-links",
+        dest="auto_branch_links",
+        action="store_false",
+        help="EPUB only: keep branch guide lines as plain text (do not auto-link).",
+    )
     p.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help="Parallel download jobs")
-    p.set_defaults(handle_separators=True)
+    p.set_defaults(handle_separators=True, auto_branch_links=True)
     args = p.parse_args()
     rate_limiter = RateLimiter(DEFAULT_DELAY)
 
@@ -1926,6 +1996,7 @@ def main() -> None:
                     args.handle_separators,
                     limiter=rate_limiter,
                     vertical_text=args.vertical_text,
+                    auto_branch_links=args.auto_branch_links,
                 )
                 print(f"\nWrote {out_path}")
 
@@ -1955,6 +2026,7 @@ def main() -> None:
                         limiter=rate_limiter,
                         volume_breaks=volume_breaks,
                         vertical_text=args.vertical_text,
+                        auto_branch_links=args.auto_branch_links,
                     )
                     print(f"\nWrote {out_path}")
             else:
@@ -2022,6 +2094,7 @@ def main() -> None:
                 limiter=rate_limiter,
                 volume_breaks=volume_breaks if fmt == "epub" else None,
                 vertical_text=args.vertical_text,
+                auto_branch_links=args.auto_branch_links,
             )
             print(f"\nWrote {out_path}")
 
